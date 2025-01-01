@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+from typing import Any, ClassVar
+
+from django.conf import settings
+from django.core.cache import cache
+from django.db import IntegrityError, models, router, transaction
+from django.utils import timezone
+
+from sentry.backup.scopes import RelocationScope
+from sentry.db.models import (
+    BoundedPositiveIntegerField,
+    FlexibleForeignKey,
+    JSONField,
+    Model,
+    region_silo_model,
+    sane_repr,
+)
+from sentry.db.models.fields.hybrid_cloud_foreign_key import HybridCloudForeignKey
+from sentry.db.models.manager.base import BaseManager
+
+
+class OnboardingTask:
+    FIRST_PROJECT = 1
+    FIRST_EVENT = 2
+    INVITE_MEMBER = 3
+    SECOND_PLATFORM = 4
+    USER_CONTEXT = 5
+    RELEASE_TRACKING = 6
+    SOURCEMAPS = 7
+    USER_REPORTS = 8
+    ISSUE_TRACKER = 9
+    ALERT_RULE = 10
+    FIRST_TRANSACTION = 11
+    METRIC_ALERT = 12
+    INTEGRATIONS = 13
+    SESSION_REPLAY = 14
+    REAL_TIME_NOTIFICATIONS = 15
+    LINK_SENTRY_TO_SOURCE_CODE = 16
+
+
+class OnboardingTaskStatus:
+    COMPLETE = 1
+    PENDING = 2
+    SKIPPED = 3
+
+
+# NOTE: data fields for some event types are as follows:
+#
+#   FIRST_EVENT:      { 'platform':  'flask', }
+#   INVITE_MEMBER:    { 'invited_member': user.id, 'teams': [team.id] }
+#   ISSUE_TRACKER:    { 'plugin': 'plugin_name' }
+#   ISSUE_ASSIGNMENT: { 'assigned_member': user.id }
+#   SECOND_PLATFORM:  { 'platform': 'javascript' }
+#
+# NOTE: Currently the `PENDING` status is applicable for the following
+# onboarding tasks:
+#
+#   FIRST_EVENT:     User confirms that sdk has been installed
+#   INVITE_MEMBER:   Until the member has successfully joined org
+#   SECOND_PLATFORM: User confirms that sdk has been installed
+#   USER_CONTEXT:    User has added user context to sdk
+#   ISSUE_TRACKER:   Tracker added, issue not yet created
+
+
+class OrganizationOnboardingTaskManager(BaseManager["OrganizationOnboardingTask"]):
+    def record(self, organization_id, task, **kwargs):
+        cache_key = f"organizationonboardingtask:{organization_id}:{task}"
+        if cache.get(cache_key) is None:
+            try:
+                with transaction.atomic(router.db_for_write(OrganizationOnboardingTask)):
+                    self.create(organization_id=organization_id, task=task, **kwargs)
+                    return True
+            except IntegrityError:
+                pass
+
+            # Store marker to prevent running all the time
+            cache.set(cache_key, 1, 3600)
+
+        return False
+
+
+class AbstractOnboardingTask(Model):
+    """
+    An abstract onboarding task that can be subclassed. This abstract model exists so that the Sandbox can create a subclass
+    which allows for the creation of tasks that are unique to users instead of organizations.
+    """
+
+    __relocation_scope__ = RelocationScope.Excluded
+
+    STATUS_CHOICES = (
+        (OnboardingTaskStatus.COMPLETE, "complete"),
+        (OnboardingTaskStatus.PENDING, "pending"),
+        (OnboardingTaskStatus.SKIPPED, "skipped"),
+    )
+
+    STATUS_KEY_MAP = dict(STATUS_CHOICES)
+    STATUS_LOOKUP_BY_KEY = {v: k for k, v in STATUS_CHOICES}
+
+    organization = FlexibleForeignKey("sentry.Organization")
+    user_id = HybridCloudForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete="SET_NULL")
+    status = BoundedPositiveIntegerField(choices=[(k, str(v)) for k, v in STATUS_CHOICES])
+    completion_seen = models.DateTimeField(null=True)
+    date_completed = models.DateTimeField(default=timezone.now)
+    project = FlexibleForeignKey("sentry.Project", db_constraint=False, null=True)
+    # INVITE_MEMBER { invited_member: user.id }
+    data: models.Field[dict[str, Any], dict[str, Any]] = JSONField()
+
+    # abstract
+    TASK_LOOKUP_BY_KEY: dict[str, int]
+    SKIPPABLE_TASKS: frozenset[int]
+    NEW_SKIPPABLE_TASKS: frozenset[int]
+
+    class Meta:
+        abstract = True
+
+
+@region_silo_model
+class OrganizationOnboardingTask(AbstractOnboardingTask):
+    """
+    Onboarding tasks walk new Sentry orgs through basic features of Sentry.
+    """
+
+    TASK_CHOICES = (
+        (OnboardingTask.FIRST_PROJECT, "create_project"),
+        (OnboardingTask.FIRST_EVENT, "send_first_event"),
+        (OnboardingTask.INVITE_MEMBER, "invite_member"),
+        (OnboardingTask.SECOND_PLATFORM, "setup_second_platform"),
+        (OnboardingTask.USER_CONTEXT, "setup_user_context"),
+        (OnboardingTask.RELEASE_TRACKING, "setup_release_tracking"),
+        (OnboardingTask.SOURCEMAPS, "setup_sourcemaps"),
+        (OnboardingTask.USER_REPORTS, "setup_user_reports"),
+        # TODO(Telemety Experience): This task is no longer shown
+        # in the new experience and shall remove it from code
+        (OnboardingTask.ISSUE_TRACKER, "setup_issue_tracker"),
+        (OnboardingTask.ALERT_RULE, "setup_alert_rules"),
+        (OnboardingTask.FIRST_TRANSACTION, "setup_transactions"),
+        (OnboardingTask.METRIC_ALERT, "setup_metric_alert_rules"),
+        (OnboardingTask.INTEGRATIONS, "setup_integrations"),
+        (OnboardingTask.SESSION_REPLAY, "setup_session_replay"),
+        (OnboardingTask.REAL_TIME_NOTIFICATIONS, "setup_real_time_notifications"),
+        (OnboardingTask.LINK_SENTRY_TO_SOURCE_CODE, "link_sentry_to_source_code"),
+    )
+
+    # Used in the API to map IDs to string keys. This keeps things
+    # a bit more maintainable on the frontend.
+    TASK_KEY_MAP = dict(TASK_CHOICES)
+    TASK_LOOKUP_BY_KEY = {v: k for k, v in TASK_CHOICES}
+
+    task = BoundedPositiveIntegerField(choices=[(k, str(v)) for k, v in TASK_CHOICES])
+
+    # Tasks which should be completed for the onboarding to be considered
+    # complete.
+    REQUIRED_ONBOARDING_TASKS = frozenset(
+        [
+            OnboardingTask.FIRST_PROJECT,
+            OnboardingTask.FIRST_EVENT,
+            OnboardingTask.INVITE_MEMBER,
+            OnboardingTask.SECOND_PLATFORM,
+            # TODO(Telemety Experience): This task is no longer shown
+            # in the new experience and shall be removed after GA
+            OnboardingTask.USER_CONTEXT,
+            OnboardingTask.RELEASE_TRACKING,
+            OnboardingTask.SOURCEMAPS,
+            OnboardingTask.ALERT_RULE,
+            OnboardingTask.FIRST_TRANSACTION,
+            # TODO(Telemety Experience): This task is no longer shown
+            # in the new experience and shall be removed after GA
+            OnboardingTask.METRIC_ALERT,
+            OnboardingTask.INTEGRATIONS,
+            OnboardingTask.SESSION_REPLAY,
+        ]
+    )
+
+    NEW_REQUIRED_ONBOARDING_TASKS = frozenset(
+        [
+            OnboardingTask.FIRST_PROJECT,
+            OnboardingTask.FIRST_EVENT,
+            OnboardingTask.INVITE_MEMBER,
+            OnboardingTask.SECOND_PLATFORM,
+            OnboardingTask.RELEASE_TRACKING,
+            # TODO(Telemetry Experience): This task is shown conditionally
+            # according to the platform.
+            # Check if we can do the same here and mark onboarding as
+            # complete if platform does not support sourcemaps
+            OnboardingTask.SOURCEMAPS,
+            OnboardingTask.ALERT_RULE,
+            OnboardingTask.FIRST_TRANSACTION,
+            OnboardingTask.SESSION_REPLAY,
+            OnboardingTask.REAL_TIME_NOTIFICATIONS,
+            OnboardingTask.LINK_SENTRY_TO_SOURCE_CODE,
+        ]
+    )
+
+    SKIPPABLE_TASKS = frozenset(
+        [
+            OnboardingTask.INVITE_MEMBER,
+            OnboardingTask.SECOND_PLATFORM,
+            OnboardingTask.USER_CONTEXT,
+            OnboardingTask.RELEASE_TRACKING,
+            OnboardingTask.SOURCEMAPS,
+            # TODO(Telemetry Experience): This task is not shown in the quick start
+            # but it is still used in the frontend, check if we can remove it from code
+            OnboardingTask.USER_REPORTS,
+            OnboardingTask.ISSUE_TRACKER,
+            OnboardingTask.ALERT_RULE,
+            OnboardingTask.FIRST_TRANSACTION,
+            OnboardingTask.METRIC_ALERT,
+            OnboardingTask.INTEGRATIONS,
+            OnboardingTask.SESSION_REPLAY,
+        ]
+    )
+
+    NEW_SKIPPABLE_TASKS = frozenset(
+        [
+            OnboardingTask.INVITE_MEMBER,
+            OnboardingTask.SECOND_PLATFORM,
+            OnboardingTask.RELEASE_TRACKING,
+            OnboardingTask.SOURCEMAPS,
+            OnboardingTask.ALERT_RULE,
+            OnboardingTask.FIRST_TRANSACTION,
+            OnboardingTask.SESSION_REPLAY,
+            OnboardingTask.REAL_TIME_NOTIFICATIONS,
+            OnboardingTask.LINK_SENTRY_TO_SOURCE_CODE,
+        ]
+    )
+
+    objects: ClassVar[OrganizationOnboardingTaskManager] = OrganizationOnboardingTaskManager()
+
+    class Meta:
+        app_label = "sentry"
+        db_table = "sentry_organizationonboardingtask"
+        unique_together = (("organization", "task"),)
+
+    __repr__ = sane_repr("organization", "task")

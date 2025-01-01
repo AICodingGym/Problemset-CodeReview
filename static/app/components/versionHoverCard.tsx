@@ -1,0 +1,216 @@
+import styled from '@emotion/styled';
+
+import type {Client} from 'sentry/api';
+import AvatarList from 'sentry/components/avatar/avatarList';
+import Tag from 'sentry/components/badge/tag';
+import {LinkButton} from 'sentry/components/button';
+import {Flex} from 'sentry/components/container/flex';
+import {CopyToClipboardButton} from 'sentry/components/copyToClipboardButton';
+import {Hovercard} from 'sentry/components/hovercard';
+import LastCommit from 'sentry/components/lastCommit';
+import LoadingError from 'sentry/components/loadingError';
+import LoadingIndicator from 'sentry/components/loadingIndicator';
+import TimeSince from 'sentry/components/timeSince';
+import Version from 'sentry/components/version';
+import {t} from 'sentry/locale';
+import {space} from 'sentry/styles/space';
+import type {Repository} from 'sentry/types/integrations';
+import type {Organization} from 'sentry/types/organization';
+import type {Deploy, Release} from 'sentry/types/release';
+import {defined} from 'sentry/utils';
+import withApi from 'sentry/utils/withApi';
+import withRelease from 'sentry/utils/withRelease';
+import withRepositories from 'sentry/utils/withRepositories';
+
+interface Props extends React.ComponentProps<typeof Hovercard> {
+  api: Client;
+  organization: Organization;
+  projectSlug: string;
+
+  releaseVersion: string;
+  deploys?: Array<Deploy>;
+  deploysError?: Error;
+  deploysLoading?: boolean;
+  release?: Release;
+  releaseError?: Error;
+  releaseLoading?: boolean;
+  repositories?: Array<Repository>;
+  repositoriesError?: Error;
+  repositoriesLoading?: boolean;
+}
+
+function VersionHoverCard({
+  api: _api,
+  projectSlug: _projectSlug,
+  deploysLoading,
+  deploysError,
+  release,
+  releaseLoading,
+  releaseError,
+  repositories,
+  repositoriesLoading,
+  repositoriesError,
+  organization,
+  deploys,
+  releaseVersion,
+  children,
+  ...hovercardProps
+}: Props) {
+  function getRepoLink() {
+    const orgSlug = organization.slug;
+    return {
+      header: null,
+      body: (
+        <ConnectRepo>
+          <h5>{t('Releases are better with commit data!')}</h5>
+          <p>
+            {t(
+              'Connect a repository to see commit info, files changed, and authors involved in future releases.'
+            )}
+          </p>
+          <LinkButton to={`/organizations/${orgSlug}/repos/`} priority="primary">
+            {t('Connect a repository')}
+          </LinkButton>
+        </ConnectRepo>
+      ),
+    };
+  }
+
+  function getBody() {
+    if (release === undefined || !defined(deploys)) {
+      return {header: null, body: null};
+    }
+
+    const recentDeploysByEnvironment = deploys
+      .toSorted(
+        // Sorted by most recent deploy first
+        (a, b) => new Date(b.dateFinished).getTime() - new Date(a.dateFinished).getTime()
+      )
+      .slice(0, 3);
+
+    return {
+      header: <VersionHoverHeader releaseVersion={releaseVersion} />,
+      body: (
+        <Flex column gap={space(2)}>
+          <Flex gap={space(2)} justify="space-between">
+            <div>
+              <h6>{t('New Issues')}</h6>
+              <CountSince>{release.newGroups}</CountSince>
+            </div>
+            <div>
+              <h6 style={{textAlign: 'right'}}>
+                {release.commitCount}{' '}
+                {release.commitCount !== 1 ? t('commits ') : t('commit ')} {t('by ')}{' '}
+                {release.authors.length}{' '}
+                {release.authors.length !== 1 ? t('authors') : t('author')}{' '}
+              </h6>
+              <AvatarList
+                users={release.authors}
+                avatarSize={25}
+                tooltipOptions={{container: 'body'} as any}
+                typeAvatars="authors"
+              />
+            </div>
+          </Flex>
+          {release.lastCommit && <LastCommit commit={release.lastCommit} />}
+          {deploys.length > 0 && (
+            <Flex column gap={space(0.5)}>
+              <h6>{t('Deploys')}</h6>
+              {recentDeploysByEnvironment.map(deploy => {
+                return (
+                  <Flex
+                    key={deploy.id}
+                    align="center"
+                    gap={space(1)}
+                    justify="space-between"
+                  >
+                    <Tag type="highlight" textMaxWidth={150}>
+                      {deploy.environment}
+                    </Tag>
+                    {deploy.dateFinished && (
+                      <StyledTimeSince date={deploy.dateFinished} />
+                    )}
+                  </Flex>
+                );
+              })}
+            </Flex>
+          )}
+        </Flex>
+      ),
+    };
+  }
+
+  let header: React.ReactNode = null;
+  let body: React.ReactNode = null;
+
+  const loading = !!(deploysLoading || releaseLoading || repositoriesLoading);
+  const error = deploysError ?? releaseError ?? repositoriesError;
+  const hasRepos = repositories && repositories.length > 0;
+
+  if (loading) {
+    body = <LoadingIndicator mini />;
+  } else if (error) {
+    body = <LoadingError />;
+  } else {
+    const renderObj: {body: React.ReactNode; header: React.ReactNode} =
+      hasRepos && release ? getBody() : getRepoLink();
+    header = renderObj.header;
+    body = renderObj.body;
+  }
+
+  return (
+    <Hovercard {...hovercardProps} header={header} body={body}>
+      {children}
+    </Hovercard>
+  );
+}
+
+interface VersionHoverHeaderProps {
+  releaseVersion: string;
+}
+
+function VersionHoverHeader({releaseVersion}: VersionHoverHeaderProps) {
+  return (
+    <Flex align="center" gap={space(0.5)}>
+      {t('Release:')}
+      <VersionWrapper>
+        <StyledVersion version={releaseVersion} truncate anchor={false} />
+        <CopyToClipboardButton
+          borderless
+          iconSize="xs"
+          size="zero"
+          text={releaseVersion}
+        />
+      </VersionWrapper>
+    </Flex>
+  );
+}
+
+export default withApi(withRelease(withRepositories(VersionHoverCard)));
+
+const ConnectRepo = styled('div')`
+  padding: ${space(2)};
+  text-align: center;
+`;
+
+const StyledTimeSince = styled(TimeSince)`
+  color: ${p => p.theme.gray300};
+  font-size: ${p => p.theme.fontSizeSmall};
+`;
+
+const VersionWrapper = styled('div')`
+  display: flex;
+  align-items: center;
+  gap: ${space(0.5)};
+  justify-content: flex-end;
+`;
+
+const StyledVersion = styled(Version)`
+  max-width: 190px;
+  font-weight: ${p => p.theme.fontWeightNormal};
+`;
+
+const CountSince = styled('div')`
+  color: ${p => p.theme.headingColor};
+  font-size: ${p => p.theme.headerFontSize};
+`;
